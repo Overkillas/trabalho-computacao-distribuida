@@ -190,8 +190,8 @@ def ler_dimensoes_usuario():
 def run_benchmark(servers, seed=42):
 
     sizes = [20, 40, 60, 80, 120, 160, 200, 240, 280, 320,
-             360, 400, 450, 500, 600, 700, 800, 900, 1000,
-             1200, 1400, 1600, 1800, 2000]
+             360, 400, 450, 500, 750, 1000,
+             1250, 1500, 2000]
 
     results = []
     np.random.seed(seed)
@@ -260,21 +260,98 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         '--benchmark', action='store_true',
-        help="Executa benchmark automático com vários tamanhos"
+        help="Executa benchmark automático com 15 tamanhos"
     )
 
     args = parser.parse_args()
 
-    servers = [(host, int(port)) for host, port in
-               (s.split(":") for s in args.servers)]
+    # Monta lista de servidores
+    servers = []
+    for s in args.servers:
+        host, port = s.split(":")
+        servers.append((host, int(port)))
 
-    # Se o usuário pediu benchmark:
+    # ================================
+    # === MODO BENCHMARK ATIVADO? ====
+    # ================================
     if args.benchmark:
+        print("\n=== MODO BENCHMARK ATIVADO ===")
         run_benchmark(servers, seed=args.seed)
         exit(0)
 
-    # Modo normal
+    # ================================
+    # === MODO NORMAL (SEM MEXER) ====
+    # ================================
+
+    # Lê dimensões das matrizes
     m, n, p = ler_dimensoes_usuario()
+
+    # Gera matrizes aleatórias
     np.random.seed(args.seed)
     A = np.random.randint(-5, 6, size=(m, n))
     B = np.random.randint(-5, 6, size=(n, p))
+
+    print("\n=== MATRIZES GERADAS ===")
+    print(f"A: {A.shape[0]}x{A.shape[1]}")
+    print(A)
+    print(f"\nB: {B.shape[0]}x{B.shape[1]}")
+    print(B)
+
+    # Multiplicação LOCAL (3 for)
+    print("\n>>> Executando multiplicação LOCAL ...")
+    t0 = time.perf_counter()
+    C_local = naive_matmul(A, B)
+    t1 = time.perf_counter()
+    tempo_local = t1 - t0
+
+    # Multiplicação DISTRIBUÍDA
+    print("\n>>> Executando multiplicação DISTRIBUÍDA...")
+    t0 = time.perf_counter()
+    C_dist = distributed_matmul(A, B, servers)
+    t1 = time.perf_counter()
+    tempo_dist = t1 - t0
+
+    # Validação com NumPy (somente para conferir corretude)
+    C_numpy = A @ B
+    ok_local = np.array_equal(C_local, C_numpy)
+    ok_dist = np.array_equal(C_dist, C_numpy)
+
+    # === TABELA BONITA COM PANDAS NO CONSOLE ===
+    print("\n\n====================== RESULTADOS ======================\n")
+
+    df_resultados = pd.DataFrame({
+        "Método": ["Local", "Distribuído"],
+        "Tempo (s)": [tempo_local, tempo_dist],
+        "Correto (== NumPy)": ["Sim" if ok_local else "Não",
+                               "Sim" if ok_dist else "Não"]
+    })
+
+    print(df_resultados.to_string(index=False,
+                                  float_format=lambda x: f"{x:.6f}"))
+
+    print("\n========================================================\n")
+
+    # Comentário de desempenho
+    if tempo_dist > 0 and tempo_local > 0:
+        if tempo_dist < tempo_local:
+            ganho = tempo_local / tempo_dist
+            red = (tempo_local - tempo_dist) / tempo_local * 100
+            print(f"A versão DISTRIBUÍDA foi {ganho:.2f}x mais rápida que a LOCAL.")
+            print(f"Redução de tempo aproximada: {red:.2f}%\n")
+        else:
+            piora = tempo_dist / tempo_local
+            aum = (tempo_dist - tempo_local) / tempo_local * 100
+            print(f"A versão DISTRIBUÍDA foi {piora:.2f}x mais lenta que a LOCAL.")
+            print(f"Aumento de tempo aproximado: {aum:.2f}%\n")
+    else:
+        print("⚠ Tempos muito pequenos para comparar desempenho com segurança.\n")
+
+    print("(Observação: NumPy foi usado apenas como 'gabarito' para validar o resultado.)\n")
+
+    # Plots numéricos de A, B e C distribuída
+    try:
+        plot_matrix_numbers(A, "Matriz A")
+        plot_matrix_numbers(B, "Matriz B")
+        plot_matrix_numbers(C_dist, "Matriz C (resultado DISTRIBUÍDO)")
+    except Exception as e:
+        print(f"\n[AVISO] Não foi possível plotar os gráficos: {e}")
