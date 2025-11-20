@@ -10,24 +10,28 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
+# Envia um objeto para o servidor.
+# Aqui a ideia é transformar o objeto em bytes com pickle,
+# colocar um cabeçalho dizendo o tamanho total e mandar tudo pela rede.
 def send_msg(conn, obj):
-    """Envia um objeto Python com pickle + cabeçalho de tamanho (4 bytes)."""
     data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
     header = struct.pack('!I', len(data))
     conn.sendall(header + data)
 
 
+# Recebe um objeto enviado pelo servidor.
+# Primeiro chega o tamanho (4 bytes), depois buscamos o restante dos dados.
 def recv_msg(conn):
-    """Recebe um objeto Python usando cabeçalho de 4 bytes com o tamanho."""
     header = b''
     while len(header) < 4:
         chunk = conn.recv(4 - len(header))
         if not chunk:
             raise ConnectionError("server closed")
         header += chunk
-    msglen = struct.unpack('!I', header)[0]
 
+    msglen = struct.unpack('!I', header)[0]
     data = b''
+
     while len(data) < msglen:
         chunk = conn.recv(min(4096, msglen - len(data)))
         if not chunk:
@@ -37,8 +41,10 @@ def recv_msg(conn):
     return pickle.loads(data)
 
 
+# Esta função é usada pelas threads.
+# Cada thread envia seu pedaço da matriz A e a matriz B inteira para um servidor.
+# Depois ela recebe a parte correspondente do resultado.
 def worker_send_receive(server_addr, A_sub, B, out_queue, idx):
-    """Thread worker: envia submatriz A_sub e B para um servidor e recebe C_sub."""
     host, port = server_addr
     try:
         with socket.create_connection((host, port), timeout=6000) as s:
@@ -54,13 +60,11 @@ def worker_send_receive(server_addr, A_sub, B, out_queue, idx):
         out_queue.put((idx, e))
 
 
+# Divide a matriz A em blocos de linhas para distribuir entre os servidores.
+# Cada servidor fica responsável por calcular um pedaço da multiplicação.
 def split_matrix_rows(A, parts):
-    """
-    Divide a matriz A em 'parts' blocos de linhas aproximadamente iguais.
-    Garante que 'parts' nunca seja maior que o número de linhas.
-    """
     n_rows = A.shape[0]
-    parts = min(parts, n_rows)  # nunca mais workers que linhas
+    parts = min(parts, n_rows)
 
     sizes = [n_rows // parts] * parts
     for i in range(n_rows % parts):
@@ -75,14 +79,10 @@ def split_matrix_rows(A, parts):
     return blocks
 
 
+# Aqui acontece a multiplicação distribuída de verdade.
+# O cliente separa A em blocos, manda cada bloco para um servidor,
+# recebe os resultados e monta a matriz final empilhando tudo.
 def distributed_matmul(A, B, servers):
-    """
-    Multiplicação distribuída:
-    - Divide A por linhas
-    - Distribui os blocos entre os servidores
-    - Cada servidor calcula C_sub = A_sub x B
-    - O cliente empilha (vstack) os resultados
-    """
     num_workers = len(servers)
     parts = split_matrix_rows(A, num_workers)
 
@@ -109,20 +109,19 @@ def distributed_matmul(A, B, servers):
     for t in threads:
         t.join(timeout=0.1)
 
-    C = np.vstack(results)
-    return C
+    return np.vstack(results)
 
 
+# Esta é a multiplicação local usando 3 loops.
+# É a forma “padrão” ensinada na disciplina, então usamos ela
+# para comparar com a versão distribuída.
 def naive_matmul(A, B):
-    """
-    Multiplicação LOCAL.
-    Mesmo algoritmo conceitual usado no servidor (para ser comparável).
-    """
     A = np.array(A, dtype=int)
     B = np.array(B, dtype=int)
 
     m, n = A.shape
     nB, p = B.shape
+
     if n != nB:
         raise ValueError(f"Dimensões incompatíveis: A={A.shape}, B={B.shape}")
 
@@ -137,11 +136,9 @@ def naive_matmul(A, B):
     return C
 
 
+# Apenas gera uma visualização bonitinha de matriz até 20x20.
+# Isso ajuda muito para analisar exemplos pequenos.
 def plot_matrix_numbers(M, title="Matriz"):
-    """
-    Mostra a matriz M como tabela de números (até 15x15) em janela gráfica.
-    Serve para visualizar A, B e C de forma mais organizada.
-    """
     M = np.array(M)
 
     max_rows = min(20, M.shape[0])
@@ -161,10 +158,8 @@ def plot_matrix_numbers(M, title="Matriz"):
     plt.show()
 
 
+# Apenas pergunta ao usuário o tamanho de A e B e garante que é possível multiplicar.
 def ler_dimensoes_usuario():
-    """
-    Lê as dimensões de A e B garantindo que A(m×n) x B(n×p) seja válida.
-    """
     while True:
         try:
             print("\n=== Definição das dimensões das matrizes ===")
@@ -183,13 +178,17 @@ def ler_dimensoes_usuario():
                 continue
 
             return m, n, p
+
         except ValueError:
             print("\n[ERRO] Digite apenas inteiros.\n")
 
 
+######################################################
+# BENCHMARK — roda vários tamanhos automaticamente
+# para comparar o local vs distribuído.
+######################################################
 def run_benchmark(servers, seed=42):
 
-    # Agora vai até 2000, com maior densidade no início e mais espaçado depois
     sizes = [20, 40, 60, 80, 120, 160, 200, 240, 280, 320,
              360, 400, 450, 500, 600, 700, 800, 900, 1000,
              1200, 1400, 1600, 1800, 2000]
@@ -203,19 +202,19 @@ def run_benchmark(servers, seed=42):
         A = np.random.randint(-5, 6, size=(n, n))
         B = np.random.randint(-5, 6, size=(n, n))
 
-        # --- Local ---
+        # Tempo local
         t0 = time.perf_counter()
         C_local = naive_matmul(A, B)
         t1 = time.perf_counter()
         t_local = t1 - t0
 
-        # --- Distribuído ---
+        # Tempo distribuído
         t0 = time.perf_counter()
         C_dist = distributed_matmul(A, B, servers)
         t1 = time.perf_counter()
         t_dist = t1 - t0
 
-        # --- Correctness ---
+        # Validação
         C_np = A @ B
         correct_local = np.array_equal(C_local, C_np)
         correct_dist = np.array_equal(C_dist, C_np)
@@ -228,14 +227,12 @@ def run_benchmark(servers, seed=42):
             "dist_ok": correct_dist
         })
 
-    # --- DataFrame ---
     df = pd.DataFrame(results)
     print("\n\n=========== RESULTADOS DO BENCHMARK ===========\n")
     print(df.to_string(index=False,
                        float_format=lambda x: f"{x:.6f}"))
     print("\n================================================\n")
 
-    # --- Plot ---
     plt.figure(figsize=(10,5))
     plt.plot(df["size"], df["local_time"], marker="o", label="Execução Local")
     plt.plot(df["size"], df["dist_time"], marker="o", label="Execução Distribuída")
@@ -247,6 +244,10 @@ def run_benchmark(servers, seed=42):
     plt.tight_layout()
     plt.show()
 
+
+######################################################
+# PARTE PRINCIPAL
+######################################################
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -259,7 +260,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         '--benchmark', action='store_true',
-        help="Executa benchmark automático com 15 tamanhos"
+        help="Executa benchmark automático com vários tamanhos"
     )
 
     args = parser.parse_args()
@@ -267,12 +268,12 @@ if __name__ == "__main__":
     servers = [(host, int(port)) for host, port in
                (s.split(":") for s in args.servers)]
 
-    # === MODO BENCHMARK ===
+    # Se o usuário pediu benchmark:
     if args.benchmark:
         run_benchmark(servers, seed=args.seed)
         exit(0)
 
-    # === MODO NORMAL (seu comportamento original) ===
+    # Modo normal
     m, n, p = ler_dimensoes_usuario()
     np.random.seed(args.seed)
     A = np.random.randint(-5, 6, size=(m, n))
