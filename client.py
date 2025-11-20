@@ -5,16 +5,20 @@ import argparse
 import numpy as np
 import threading
 from queue import Queue
-import time  # para medir tempos
+import time
+import matplotlib.pyplot as plt
+import pandas as pd
 
 
 def send_msg(conn, obj):
+    """Envia um objeto Python com pickle + cabeçalho de tamanho (4 bytes)."""
     data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
     header = struct.pack('!I', len(data))
     conn.sendall(header + data)
 
 
 def recv_msg(conn):
+    """Recebe um objeto Python usando cabeçalho de 4 bytes com o tamanho."""
     header = b''
     while len(header) < 4:
         chunk = conn.recv(4 - len(header))
@@ -22,64 +26,74 @@ def recv_msg(conn):
             raise ConnectionError("server closed")
         header += chunk
     msglen = struct.unpack('!I', header)[0]
+
     data = b''
     while len(data) < msglen:
         chunk = conn.recv(min(4096, msglen - len(data)))
         if not chunk:
             raise ConnectionError("server closed during data")
         data += chunk
+
     return pickle.loads(data)
 
 
 def worker_send_receive(server_addr, A_sub, B, out_queue, idx):
+    """Thread worker: envia submatriz A_sub e B para um servidor e recebe C_sub."""
     host, port = server_addr
     try:
-        with socket.create_connection((host, port), timeout=60) as s:
-            # Envia submatriz de A e matriz B
+        with socket.create_connection((host, port), timeout=600) as s:
             send_msg(s, {'A_sub': A_sub.tolist(), 'B': B.tolist()})
             resp = recv_msg(s)
-            if 'error' in resp:
-                raise RuntimeError(resp['error'])
-            C_sub = np.array(resp['C_sub'])
+
+            if "error" in resp:
+                raise RuntimeError(resp["error"])
+
+            C_sub = np.array(resp["C_sub"])
             out_queue.put((idx, C_sub))
     except Exception as e:
         out_queue.put((idx, e))
 
 
 def split_matrix_rows(A, parts):
+    """
+    Divide a matriz A em 'parts' blocos de linhas aproximadamente iguais.
+    Garante que 'parts' nunca seja maior que o número de linhas.
+    """
     n_rows = A.shape[0]
+    parts = min(parts, n_rows)  # nunca mais workers que linhas
+
     sizes = [n_rows // parts] * parts
     for i in range(n_rows % parts):
         sizes[i] += 1
-    res = []
+
+    blocks = []
     start = 0
     for sz in sizes:
-        res.append(A[start:start+sz, :])
+        blocks.append(A[start:start + sz, :])
         start += sz
-    return res
+
+    return blocks
 
 
 def distributed_matmul(A, B, servers):
     """
-    Divide A em blocos de linhas e distribui entre os servidores.
-    Garante que NUNCA haverá mais workers do que linhas de A,
-    para evitar blocos vazios (0xN) causando erros estranhos.
+    Multiplicação distribuída:
+    - Divide A por linhas
+    - Distribui os blocos entre os servidores
+    - Cada servidor calcula C_sub = A_sub x B
+    - O cliente empilha (vstack) os resultados
     """
-    if A.shape[0] == 0:
-        raise ValueError("Matriz A não pode ter zero linhas.")
-
-    # limite de workers = min(nº de servidores, nº de linhas de A)
-    num_workers = min(len(servers), A.shape[0])
-
+    num_workers = len(servers)
     parts = split_matrix_rows(A, num_workers)
+
     out_queue = Queue()
     threads = []
 
-    for i, part in enumerate(parts):
-        server = servers[i % len(servers)]
+    for idx, part in enumerate(parts):
+        server = servers[idx % len(servers)]
         t = threading.Thread(
             target=worker_send_receive,
-            args=(server, part, B, out_queue, i),
+            args=(server, part, B, out_queue, idx),
             daemon=True
         )
         threads.append(t)
@@ -95,138 +109,172 @@ def distributed_matmul(A, B, servers):
     for t in threads:
         t.join(timeout=0.1)
 
-    C = np.vstack(results) if len(results) > 0 else np.array([[]])
+    C = np.vstack(results)
     return C
 
 
 def naive_matmul(A, B):
     """
-    Multiplicação de matrizes ingênua em Python puro (3 laços for).
-    Serve como 'versão local sequencial' para comparação com a distribuída.
+    Multiplicação LOCAL.
+    Mesmo algoritmo conceitual usado no servidor (para ser comparável).
     """
+    A = np.array(A, dtype=int)
+    B = np.array(B, dtype=int)
+
     m, n = A.shape
     nB, p = B.shape
-    assert n == nB
+    if n != nB:
+        raise ValueError(f"Dimensões incompatíveis: A={A.shape}, B={B.shape}")
+
     C = np.zeros((m, p), dtype=int)
 
-    for i in range(m):         # linhas de A
-        for k in range(n):     # colunas de A / linhas de B
+    for i in range(m):
+        for k in range(n):
             aik = A[i, k]
-            for j in range(p): # colunas de B
+            for j in range(p):
                 C[i, j] += aik * B[k, j]
+
     return C
+
+
+def plot_matrix_numbers(M, title="Matriz"):
+    """
+    Mostra a matriz M como tabela de números (até 15x15) em janela gráfica.
+    Serve para visualizar A, B e C de forma mais organizada.
+    """
+    M = np.array(M)
+
+    max_rows = min(20, M.shape[0])
+    max_cols = min(20, M.shape[1])
+    sub = M[:max_rows, :max_cols]
+
+    fig, ax = plt.subplots(figsize=(max_cols * 0.7, max_rows * 0.5))
+    ax.set_axis_off()
+
+    table = ax.table(cellText=sub, loc="center", cellLoc="center")
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1.2, 1.2)
+
+    ax.set_title(f"{title} (mostrando {max_rows}x{max_cols})", pad=10)
+    plt.tight_layout()
+    plt.show()
 
 
 def ler_dimensoes_usuario():
     """
-    Lê as dimensões das matrizes A e B do usuário.
-    Garante que as matrizes possam ser multiplicadas:
-    A (m x n)  e  B (n x p)
+    Lê as dimensões de A e B garantindo que A(m×n) x B(n×p) seja válida.
     """
     while True:
         try:
             print("\n=== Definição das dimensões das matrizes ===")
-            m = int(input("Número de LINHAS da matriz A: "))
-            n = int(input("Número de COLUNAS da matriz A: "))
-
-            nB = int(input("Número de LINHAS da matriz B: "))
-            p = int(input("Número de COLUNAS da matriz B: "))
+            m = int(input("Número de LINHAS de A: "))
+            n = int(input("Número de COLUNAS de A: "))
+            nB = int(input("Número de LINHAS de B: "))
+            p = int(input("Número de COLUNAS de B: "))
 
             if m <= 0 or n <= 0 or nB <= 0 or p <= 0:
-                print("\n[ERRO] Todas as dimensões devem ser maiores que zero. Tente novamente.\n")
+                print("\n[ERRO] Todas as dimensões devem ser > 0.\n")
                 continue
 
             if n != nB:
-                print("\n[ERRO] Não é possível multiplicar A ({}x{}) por B ({}x{}).".format(m, n, nB, p))
-                print("       O número de COLUNAS de A deve ser igual ao número de LINHAS de B.")
-                print("       Por favor, informe novas dimensões.\n")
+                print("\n[ERRO] Para multiplicar: A(m×n) × B(n×p).")
+                print("      As COLUNAS de A devem ser iguais às LINHAS de B.\n")
                 continue
 
-            return m, n, p  # B terá (n x p)
-
+            return m, n, p
         except ValueError:
-            print("\n[ERRO] Digite apenas números inteiros. Tente novamente.\n")
+            print("\n[ERRO] Digite apenas inteiros.\n")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--servers', nargs='+', required=True,
-                        help='Lista de servidores no formato host:port')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Seed para geração aleatória das matrizes')
+    parser.add_argument(
+        '--servers', nargs='+', required=True,
+        help="Lista de servidores host:port (ex: 127.0.0.1:5001 127.0.0.1:5002)"
+    )
+    parser.add_argument(
+        '--seed', type=int, default=42,
+        help="Seed para geração aleatória das matrizes"
+    )
     args = parser.parse_args()
 
     # Monta lista de servidores
     servers = []
     for s in args.servers:
-        host, port = s.split(':')
+        host, port = s.split(":")
         servers.append((host, int(port)))
 
-    # Lê dimensões desejadas do usuário, garantindo que a multiplicação seja possível
+    # Lê dimensões das matrizes
     m, n, p = ler_dimensoes_usuario()
 
-    # Gera matrizes aleatórias com as dimensões informadas
+    # Gera matrizes aleatórias
     np.random.seed(args.seed)
     A = np.random.randint(-5, 6, size=(m, n))
     B = np.random.randint(-5, 6, size=(n, p))
 
-    print("\n=== Matrizes geradas aleatoriamente ===")
-    print("\nMatriz A ({}x{}):".format(m, n))
+    print("\n=== MATRIZES GERADAS ===")
+    print(f"A: {A.shape[0]}x{A.shape[1]}")
     print(A)
-    print("\nMatriz B ({}x{}):".format(n, p))
+    print(f"\nB: {B.shape[0]}x{B.shape[1]}")
     print(B)
 
-    # 1) Multiplicação LOCAL INGUÊNUA (3 for)
-    print("\nCalculando multiplicação LOCAL (ingênua, 3 laços for)...")
-    t0_local = time.perf_counter()
+    # Multiplicação LOCAL (3 for)
+    print("\n>>> Executando multiplicação LOCAL ...")
+    t0 = time.perf_counter()
     C_local = naive_matmul(A, B)
-    t1_local = time.perf_counter()
-    tempo_local = t1_local - t0_local
-    print(f"Tempo da multiplicação LOCAL (ingênua): {tempo_local:.6f} segundos")
+    t1 = time.perf_counter()
+    tempo_local = t1 - t0
 
-    # 2) Multiplicação DISTRIBUÍDA
-    print("\nEnviando partes da matriz A para os servidores (cálculo DISTRIBUÍDO)...")
-    t0_dist = time.perf_counter()
+    # Multiplicação DISTRIBUÍDA
+    print("\n>>> Executando multiplicação DISTRIBUÍDA...")
+    t0 = time.perf_counter()
     C_dist = distributed_matmul(A, B, servers)
-    t1_dist = time.perf_counter()
-    tempo_dist = t1_dist - t0_dist
+    t1 = time.perf_counter()
+    tempo_dist = t1 - t0
 
-    print("\nMatriz C (resultado DISTRIBUÍDO) - dimensão {}x{}:".format(C_dist.shape[0], C_dist.shape[1]))
-    print(C_dist)
-    print(f"\nTempo da multiplicação DISTRIBUÍDA: {tempo_dist:.6f} segundos")
-
-    # 3) Validação com NumPy (referência de corretude)
-    print("\nValidando resultados com NumPy (A @ B)...")
+    # Validação com NumPy (somente para conferir corretude)
     C_numpy = A @ B
-    iguais_local = np.array_equal(C_local, C_numpy)
-    iguais_dist = np.array_equal(C_dist, C_numpy)
+    ok_local = np.array_equal(C_local, C_numpy)
+    ok_dist = np.array_equal(C_dist, C_numpy)
 
-    print("Local ingênuo == NumPy?     ", iguais_local)
-    print("Distribuído    == NumPy?    ", iguais_dist)
+    # === TABELA BONITA COM PANDAS NO CONSOLE ===
+    print("\n\n====================== RESULTADOS ======================\n")
 
-    print(f"\nRESUMO DE TEMPOS:")
-    print(f"  Local (ingênuo, 3 for): {tempo_local:.6f} s")
-    print(f"  Distribuído (NumPy nos servidores): {tempo_dist:.6f} s")
+    df_resultados = pd.DataFrame({
+        "Método": ["Local", "Distribuído"],
+        "Tempo (s)": [tempo_local, tempo_dist],
+        "Correto (== NumPy)": ["Sim" if ok_local else "Não",
+                               "Sim" if ok_dist else "Não"]
+    })
 
-    # 4) Comparação de desempenho LOCAL x DISTRIBUÍDO
-    print("\n=== Comparação de desempenho LOCAL x DISTRIBUÍDO ===")
-    if tempo_dist > 0:
-        fator = tempo_local / tempo_dist  # quanto a distribuída é mais rápida (ou mais lenta)
+    # Formata floats com 6 casas decimais
+    print(df_resultados.to_string(index=False,
+                                  float_format=lambda x: f"{x:.6f}"))
+
+    print("\n========================================================\n")
+
+    # Comentário de desempenho
+    if tempo_dist > 0 and tempo_local > 0:
         if tempo_dist < tempo_local:
-            # distribuída mais rápida
-            diff_pct = (tempo_local - tempo_dist) / tempo_local * 100
-            print(f"A execução DISTRIBUÍDA foi aproximadamente {fator:.2f} vezes mais rápida que a LOCAL ingênua.")
-            print(f"Isto representa uma redução de {diff_pct:.2f}% no tempo de execução.")
+            ganho = tempo_local / tempo_dist
+            red = (tempo_local - tempo_dist) / tempo_local * 100
+            print(f"A versão DISTRIBUÍDA foi {ganho:.2f}x mais rápida que a LOCAL.")
+            print(f"Redução de tempo aproximada: {red:.2f}%\n")
         else:
-            # distribuída mais lenta (matrizes pequenas, overhead domina)
-            fator_inverso = tempo_dist / tempo_local
-            diff_pct = (tempo_dist - tempo_local) / tempo_local * 100
-            print(f"A execução DISTRIBUÍDA foi aproximadamente {fator_inverso:.2f} vezes mais lenta que a LOCAL ingênua.")
-            print(f"Isto representa um aumento de {diff_pct:.2f}% no tempo de execução.")
-
-        print("\nObservação:")
-        print("- Para matrizes muito pequenas, o overhead de comunicação pode tornar a versão distribuída mais lenta.")
-        print("- À medida que o tamanho das matrizes cresce, o custo do cálculo domina e a abordagem distribuída tende")
-        print("  a se tornar relativamente mais vantajosa em relação à versão local ingênua (3 laços).")
+            piora = tempo_dist / tempo_local
+            aum = (tempo_dist - tempo_local) / tempo_local * 100
+            print(f"A versão DISTRIBUÍDA foi {piora:.2f}x mais lenta que a LOCAL.")
+            print(f"Aumento de tempo aproximado: {aum:.2f}%\n")
     else:
-        print("Tempo local muito pequeno para calcular o fator de comparação.")
+        print("⚠ Tempos muito pequenos para comparar desempenho com segurança.\n")
+
+    print("(Observação: NumPy foi usado apenas como 'gabarito' para validar o resultado.)\n")
+
+    # Plots numéricos de A, B e C distribuída (opcional, para visualização)
+    try:
+        plot_matrix_numbers(A, "Matriz A")
+        plot_matrix_numbers(B, "Matriz B")
+        plot_matrix_numbers(C_dist, "Matriz C (resultado DISTRIBUÍDO)")
+    except Exception as e:
+        print(f"\n[AVISO] Não foi possível plotar os gráficos: {e}")
