@@ -91,6 +91,17 @@ def distributed_matmul(A, B, servers):
 
     for idx, part in enumerate(parts):
         server = servers[idx % len(servers)]
+
+        # =============================
+        # PRINT EXTRA — PEDIDO POR VOCÊ
+        # =============================
+        print("\n------------------------------------------------------")
+        print(f"🔹 Bloco #{idx} da matriz A enviado ao servidor {server}")
+        print(f"   Dimensões do bloco: {part.shape[0]} linhas x {part.shape[1]} colunas")
+        print("   Conteúdo do bloco:")
+        print(part)
+        print("------------------------------------------------------")
+
         t = threading.Thread(
             target=worker_send_receive,
             args=(server, part, B, out_queue, idx),
@@ -98,6 +109,7 @@ def distributed_matmul(A, B, servers):
         )
         threads.append(t)
         t.start()
+
 
     results = [None] * len(parts)
     for _ in range(len(parts)):
@@ -145,7 +157,7 @@ def plot_matrix_numbers(M, title="Matriz"):
     max_cols = min(20, M.shape[1])
     sub = M[:max_rows, :max_cols]
 
-    fig, ax = plt.subplots(figsize=(max_cols * 0.7, max_rows * 0.5))
+    ax = plt.gca()  # usa o eixo da figura atual
     ax.set_axis_off()
 
     table = ax.table(cellText=sub, loc="center", cellLoc="center")
@@ -154,8 +166,7 @@ def plot_matrix_numbers(M, title="Matriz"):
     table.scale(1.2, 1.2)
 
     ax.set_title(f"{title} (mostrando {max_rows}x{max_cols})", pad=10)
-    plt.tight_layout()
-    plt.show()
+
 
 
 # Apenas pergunta ao usuário o tamanho de A e B e garante que é possível multiplicar.
@@ -350,8 +361,18 @@ if __name__ == "__main__":
 
     # Plots numéricos de A, B e C distribuída
     try:
+        fig1, ax1 = plt.subplots()
         plot_matrix_numbers(A, "Matriz A")
+
+        fig2, ax2 = plt.subplots()
         plot_matrix_numbers(B, "Matriz B")
+
+        fig3, ax3 = plt.subplots()
         plot_matrix_numbers(C_dist, "Matriz C (resultado DISTRIBUÍDO)")
+
+        plt.show()
+
     except Exception as e:
         print(f"\n[AVISO] Não foi possível plotar os gráficos: {e}")
+
+
